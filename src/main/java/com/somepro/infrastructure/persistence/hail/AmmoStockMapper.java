@@ -38,4 +38,13 @@ public interface AmmoStockMapper extends BaseMapper<AmmoStockPO> {
                     @Param("delta") int delta,
                     @Param("produceDate") java.time.LocalDate produceDate,
                     @Param("expireDate") java.time.LocalDate expireDate);
+
+    /**
+     * 开单领用：仅当结存足够时原子扣减（{@code quantity >= qty} 才放行），
+     * 不先查后写，靠这条带条件的 UPDATE 兜住并发超发。
+     * 返回受影响行数：1 扣减成功；0 表示库存行不存在或结存不足（调用方据此报「结存不足」并回滚）。
+     */
+    @Update("UPDATE t_ammo_stock SET quantity = quantity - #{qty} "
+            + "WHERE id = #{id} AND del_flag = 0 AND quantity >= #{qty}")
+    int deductQuantity(@Param("id") Long id, @Param("qty") int qty);
 }

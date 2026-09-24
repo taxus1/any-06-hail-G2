@@ -5,14 +5,20 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.github.pagehelper.PageHelper;
 import com.somepro.common.exception.BizException;
+import com.somepro.domain.hail.model.AmmoBizType;
+import com.somepro.domain.hail.model.AmmoRecord;
 import com.somepro.domain.hail.model.AmmoStock;
 import com.somepro.domain.hail.repository.AmmoStockRepository;
 import com.somepro.domain.shared.model.PageResult;
+import com.somepro.infrastructure.persistence.hail.converter.AmmoRecordPoConverter;
 import com.somepro.infrastructure.persistence.hail.converter.AmmoStockPoConverter;
+import com.somepro.infrastructure.persistence.hail.po.AmmoRecordPO;
 import com.somepro.infrastructure.persistence.hail.po.AmmoStockPO;
 import com.somepro.infrastructure.persistence.support.BlockingRepositorySupport;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import reactor.core.publisher.Mono;
 
 import java.util.List;
@@ -27,16 +33,23 @@ import java.util.stream.Collectors;
  * 2. 查不到就 insert，若并发下另一线程已抢先插入（撞 uk_stock 抛
  *    {@link DuplicateKeyException}），退化为对刚插入那条再做一次原子累加，绝不产生第二条。
  *
- * 整个入库是一次阻塞调用，运行在 boundedElastic 线程上；不额外加 @Transactional ——
- * 原子更新与「insert 或累加」的去重由单语句 + 唯一索引保证，没有多表写需要包成一个事务。
+ * 整个入库是一次阻塞调用，运行在 boundedElastic 线程上；用 {@link TransactionTemplate}
+ * 把「结存累加 / 新建 + 追加一条 IN 入库流水」包成一个事务，库存与流水要么一起成、要么一起回滚。
+ * 原子更新与「insert 或累加」的去重由单语句 + 唯一索引保证。
  */
 @Repository
 public class AmmoStockRepositoryImpl extends BlockingRepositorySupport implements AmmoStockRepository {
 
     private final AmmoStockMapper mapper;
+    private final AmmoRecordMapper recordMapper;
+    private final TransactionTemplate txTemplate;
 
-    public AmmoStockRepositoryImpl(AmmoStockMapper mapper) {
+    public AmmoStockRepositoryImpl(AmmoStockMapper mapper,
+                                   AmmoRecordMapper recordMapper,
+                                   PlatformTransactionManager txManager) {
         this.mapper = mapper;
+        this.recordMapper = recordMapper;
+        this.txTemplate = new TransactionTemplate(txManager);
     }
 
     @Override
@@ -57,7 +70,7 @@ public class AmmoStockRepositoryImpl extends BlockingRepositorySupport implement
 
     @Override
     public Mono<AmmoStock> inbound(AmmoStock incoming) {
-        return blocking(() -> doInbound(incoming));
+        return blocking(() -> txTemplate.execute(status -> doInbound(incoming)));
     }
 
     private AmmoStock doInbound(AmmoStock incoming) {
@@ -67,13 +80,16 @@ public class AmmoStockRepositoryImpl extends BlockingRepositorySupport implement
         if (existing != null) {
             // 2a) 已有：原子累加到原记录，不另起一条
             addQty(existing.getId(), incoming);
-            return AmmoStockPoConverter.toDomain(mapper.selectById(existing.getId()));
+            AmmoStock saved = AmmoStockPoConverter.toDomain(mapper.selectById(existing.getId()));
+            writeInRecord(incoming);
+            return saved;
         }
         // 2b) 没有：新建一条
         AmmoStockPO po = AmmoStockPoConverter.toPo(incoming);
         po.setId(IdUtil.getSnowflakeNextId());
         try {
             mapper.insert(po);
+            writeInRecord(incoming);
             return AmmoStockPoConverter.toDomain(po);
         } catch (DuplicateKeyException e) {
             // 3) 并发兜底：别人抢先插了同点 + 同弹型 + 同批次，退化为累加那条
@@ -84,8 +100,19 @@ public class AmmoStockRepositoryImpl extends BlockingRepositorySupport implement
                 throw e;
             }
             addQty(winner.getId(), incoming);
-            return AmmoStockPoConverter.toDomain(mapper.selectById(winner.getId()));
+            AmmoStock saved = AmmoStockPoConverter.toDomain(mapper.selectById(winner.getId()));
+            writeInRecord(incoming);
+            return saved;
         }
+    }
+
+    /** 入库同步追加一条 IN 流水（正数），与结存变动在同一事务内，保证账实一致。 */
+    private void writeInRecord(AmmoStock incoming) {
+        AmmoRecord record = AmmoRecord.log(incoming.getSiteId(), incoming.getAmmoType(),
+                incoming.getBatchNo(), AmmoBizType.IN, incoming.getQuantity(), null);
+        AmmoRecordPO recordPO = AmmoRecordPoConverter.toPo(record);
+        recordPO.setId(IdUtil.getSnowflakeNextId());
+        recordMapper.insert(recordPO);
     }
 
     private void addQty(Long id, AmmoStock incoming) {
